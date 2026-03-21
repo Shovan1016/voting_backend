@@ -12,8 +12,22 @@ import {
   publicPolls,
   updatePool,
 } from "../services/poll.service.ts";
+import { redisClient } from "../utills/redis.ts";
 
 const pollsRouter = express.Router();
+
+pollsRouter.post("/internal/broadcast", async (req, res, next) => {
+  try {
+    const { pollId, options, total } = req.body;
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`poll:${pollId}`).emit("poll-update", { pollId, options, total });
+    }
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
 
 pollsRouter.post("/createPoll", authIsNeeded, async (req, res, next) => {
   const validationResult = await createPoolValidation.safeParseAsync(req.body);
@@ -93,6 +107,10 @@ pollsRouter.delete("/deletePool/:id", authIsNeeded, async (req, res, next) => {
   }
 
   const deletedPool = await deletePool(Number(req.params.id));
+  
+  // Cleanup Redis
+  await redisClient.del(`poll:${req.params.id}`);
+  
   return res.json({ message: "Pool deleted successfully", pool: deletedPool });
 });
 
@@ -118,6 +136,16 @@ pollsRouter.post(
       Number(req.params.id),
       Boolean(closed),
     );
+
+    // If poll is closed -> Delete cache & broadcast
+    if (closed) {
+      await redisClient.del(`poll:${req.params.id}`);
+      const io = req.app.get("io");
+      if (io) {
+        io.to(`poll:${req.params.id}`).emit("poll-closed", { pollId: Number(req.params.id) });
+      }
+    }
+
     return res.json({
       message: "Pool status updated successfully",
       pool: updatedPool,
@@ -144,8 +172,128 @@ pollsRouter.get("/publicPolls", authIsNeeded, async (req, res, next) => {
 });
 
 pollsRouter.get("/getPoll/:id", authIsNeeded, async (req, res, next) => {
-  const pool = await getPollById(Number(req.params.id));
-  return res.json({ message: "Pool retrieved successfully", pool });
+  try {
+    const pollId = Number(req.params.id);
+    const pool = await getPollById(pollId);
+    
+    if (!pool) {
+      return next(new AppError("Pool not found", 404));
+    }
+
+    const hashKey = `poll:${pollId}`;
+    const exists = await redisClient.exists(hashKey);
+
+    let totals: Record<string, number> = {};
+
+    if (exists) {
+      console.log(`Cache HIT for poll ${pollId}`);
+      const rawTotals = await redisClient.hGetAll(hashKey);
+      totals = Object.fromEntries(
+        Object.entries(rawTotals).map(([k, v]) => [k, parseInt(v, 10)])
+      );
+    } else {
+      console.log(`Cache MISS for poll ${pollId}`);
+      const { sql } = await import("drizzle-orm");
+      const db = (await import("../index.ts")).default;
+      const { votesTable } = await import("../db/schemas/votes.schema.ts");
+
+      // Query PostgreSQL count
+      const voteCounts = await db
+        .select({
+          optionId: votesTable.optionId,
+          count: sql<number>`cast(count(${votesTable.id}) as int)`,
+        })
+        .from(votesTable)
+        .where(sql`${votesTable.pollId} = ${pollId}`)
+        .groupBy(votesTable.optionId);
+
+      // Initialize all options to 0
+      pool.options.forEach((opt: any) => {
+        totals[`option_${opt.id}`] = 0;
+      });
+
+      // Populate from Postgres
+      voteCounts.forEach((vc) => {
+        totals[`option_${vc.optionId}`] = vc.count;
+      });
+
+      // Prepare Redis HSET args as [key1, val1, key2, val2...] matching strings
+      const hsetArgs: string[] = [];
+      Object.entries(totals).forEach(([key, value]) => {
+        hsetArgs.push(key, value.toString());
+      });
+
+      if (hsetArgs.length > 0) {
+        await redisClient.hSet(hashKey, hsetArgs);
+      }
+    }
+
+    return res.json({ message: "Pool retrieved successfully", pool, totals });
+  } catch (error) {
+    console.error("Redis Cache Aside Error:", error);
+    next(error);
+  }
+});
+
+pollsRouter.post("/:id/vote", authIsNeeded, async (req, res, next) => {
+  try {
+    const pollId = Number(req.params.id);
+    const { optionId } = req.body;
+    const userId = req.user!.id;
+
+    if (!optionId) {
+      return next(new AppError("optionId is required", 400));
+    }
+
+    // 1. Check if poll exists and is open, and option belongs to poll
+    const existingPool = await getPollById(pollId);
+    if (!existingPool) {
+      return next(new AppError("Poll not found", 404));
+    }
+
+    if (existingPool.closed) {
+      return next(new AppError("Poll is closed", 400));
+    }
+
+    const optionExists = existingPool.options.find((opt: any) => opt.id === optionId);
+    if (!optionExists) {
+      return next(new AppError("Option does not belong to this poll", 400));
+    }
+
+    // 2. Check for duplicate vote
+    const { eq, and } = await import("drizzle-orm");
+    const db = (await import("../index.ts")).default;
+    const { votesTable } = await import("../db/schemas/votes.schema.ts");
+
+    const existingVote = await db.query.votesTable.findFirst({
+      where: and(eq(votesTable.pollId, pollId), eq(votesTable.userId, userId)),
+    });
+
+    if (existingVote) {
+      return next(new AppError("You have already voted on this poll", 409));
+    }
+
+    // 3. Generate voteId & Publish to RabbitMQ
+    const { v4: uuidv4 } = await import("uuid");
+    const voteId = uuidv4();
+    
+    const { publishVote } = await import("../utills/rabbitmq.ts");
+    await publishVote({
+      pollId,
+      optionId,
+      userId,
+      voteId,
+    });
+
+    // 4. Return 202 Accepted
+    return res.status(202).json({
+      message: "Vote queued successfully",
+      voteId,
+    });
+  } catch (error) {
+    console.error("Vote error:", error);
+    next(error);
+  }
 });
 
 export { pollsRouter };

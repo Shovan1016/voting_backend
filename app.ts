@@ -27,6 +27,9 @@ const io = new Server(httpServer, {
   }
 });
 
+// Expose 'io' to the express routes
+app.set("io", io);
+
 app.use(cors());
 // app.use(helmet());
 app.use(express.json());
