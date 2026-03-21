@@ -1,0 +1,55 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1773498539929,
+      "tag": "0000_fixed_sheva_callister",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1773498600102,
+      "tag": "0001_fine_night_nurse",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1773498615022,
+      "tag": "0002_simple_makkari",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1773498627582,
+      "tag": "0003_clammy_havok",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1773499152937,
+      "tag": "0004_happy_morbius",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1773499295785,
+      "tag": "0005_mysterious_wind_dancer",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1773556245572,
+      "tag": "0006_cultured_kid_colt",
+      "breakpoints": true
+    }
+  ]
+}
