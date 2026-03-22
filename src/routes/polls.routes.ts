@@ -327,6 +327,147 @@ pollsRouter.post("/:id/vote", authIsNeeded, voteLimiter, async (req, res, next) 
   }
 });
 
+// ─── Helper: fetch Redis totals + build broadcast payload ─────────────────────
+async function buildAndBroadcast(pollId: number, req: any) {
+  const db = (await import("../index.ts")).default;
+  const { pollOptionsTable } = await import("../db/schemas/options.schema.ts");
+  const { eq } = await import("drizzle-orm");
+
+
+  const hashKey = `poll:${pollId}`;
+  const rawTotals = await redisClient.hGetAll(hashKey);
+
+  const optionsList = await db
+    .select({ id: pollOptionsTable.id, text: pollOptionsTable.option })
+    .from(pollOptionsTable)
+    .where(eq(pollOptionsTable.pollId, pollId));
+
+  let total = 0;
+  const options = optionsList.map((opt: any) => {
+    const votes = parseInt(rawTotals[`option_${opt.id}`] || "0", 10);
+    total += votes;
+    return { id: opt.id, text: opt.text, votes };
+  });
+
+  const apiUrl = `http://localhost:${process.env.APP_PORT || 3000}/polls/internal/broadcast`;
+  await fetch(apiUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-internal-secret": process.env.INTERNAL_SECRET || "supersecret",
+    },
+    body: JSON.stringify({ pollId, options, total }),
+  });
+}
+
+// ─── PUT /:id/vote — Change Vote ───────────────────────────────────────────────
+pollsRouter.put("/:id/vote", authIsNeeded, async (req, res, next) => {
+  try {
+    const pollId = Number(req.params.id);
+    const userId = req.user!.id;
+
+    const voteSchema = z.object({ optionId: z.number() });
+    const validationResult = voteSchema.safeParse(req.body);
+    if (!validationResult.success) {
+      return next(new AppError(validationResult.error.issues[0].message, 400));
+    }
+    const { optionId: newOptionId } = validationResult.data;
+
+    const { eq, and } = await import("drizzle-orm");
+    const db = (await import("../index.ts")).default;
+    const { votesTable } = await import("../db/schemas/votes.schema.ts");
+
+    // 1. Verify poll is open and the new option belongs to the poll
+    const existingPoll = await getPollById(pollId);
+    if (!existingPoll) return next(new AppError("Poll not found", 404));
+    if (existingPoll.closed) return next(new AppError("Poll is closed", 400));
+
+    const optionExists = existingPoll.options.find((opt: any) => opt.id === newOptionId);
+    if (!optionExists) return next(new AppError("Option does not belong to this poll", 400));
+
+    // 2. Find existing vote
+    const existingVote = await db.query.votesTable.findFirst({
+      where: and(eq(votesTable.pollId, pollId), eq(votesTable.userId, userId)),
+    });
+
+    if (!existingVote) {
+      return next(new AppError("You have not voted on this poll yet", 404));
+    }
+    if (existingVote.optionId === newOptionId) {
+      return next(new AppError("You already voted for this option", 409));
+    }
+
+    const oldOptionId = existingVote.optionId;
+
+    // 3. Update DB
+    await db
+      .update(votesTable)
+      .set({ optionId: newOptionId, updatedAt: new Date() })
+      .where(and(eq(votesTable.pollId, pollId), eq(votesTable.userId, userId)));
+
+    // 4. Sync Redis: decrement old, increment new
+    const hashKey = `poll:${pollId}`;
+    await redisClient.hIncrBy(hashKey, `option_${oldOptionId}`, -1);
+    await redisClient.hIncrBy(hashKey, `option_${newOptionId}`, 1);
+
+    // 5. Broadcast live update
+    await buildAndBroadcast(pollId, req);
+
+    return res.status(200).json({ message: "Vote changed successfully", optionId: newOptionId });
+  } catch (error) {
+    console.error("Change vote error:", error);
+    next(error);
+  }
+});
+
+// ─── DELETE /:id/vote — Withdraw Vote ─────────────────────────────────────────
+pollsRouter.delete("/:id/vote", authIsNeeded, async (req, res, next) => {
+  try {
+    const pollId = Number(req.params.id);
+    const userId = req.user!.id;
+
+    const { eq, and } = await import("drizzle-orm");
+    const db = (await import("../index.ts")).default;
+    const { votesTable } = await import("../db/schemas/votes.schema.ts");
+
+    // 1. Verify poll is open
+    const existingPoll = await getPollById(pollId);
+    if (!existingPoll) return next(new AppError("Poll not found", 404));
+    if (existingPoll.closed) return next(new AppError("Poll is closed. Cannot withdraw vote", 400));
+
+    // 2. Find existing vote
+    const existingVote = await db.query.votesTable.findFirst({
+      where: and(eq(votesTable.pollId, pollId), eq(votesTable.userId, userId)),
+    });
+
+    if (!existingVote) {
+      return next(new AppError("You have not voted on this poll", 404));
+    }
+
+    const oldOptionId = existingVote.optionId;
+
+    // 3. Delete from DB
+    await db
+      .delete(votesTable)
+      .where(and(eq(votesTable.pollId, pollId), eq(votesTable.userId, userId)));
+
+    // 4. Sync Redis: decrement the withdrawn option (floor at 0 to avoid negatives)
+    const hashKey = `poll:${pollId}`;
+    const currentVal = await redisClient.hGet(hashKey, `option_${oldOptionId}`);
+    const current = parseInt(currentVal || "0", 10);
+    await redisClient.hSet(hashKey, `option_${oldOptionId}`, Math.max(0, current - 1).toString());
+
+    // 5. Broadcast live update
+    await buildAndBroadcast(pollId, req);
+
+    return res.status(200).json({ message: "Vote withdrawn successfully" });
+  } catch (error) {
+    console.error("Withdraw vote error:", error);
+    next(error);
+  }
+});
+
+// ─── GET /:id/myVote ──────────────────────────────────────────────────────────
 pollsRouter.get("/:id/myVote", authIsNeeded, async (req, res, next) => {
   try {
     const pollId = Number(req.params.id);
