@@ -10,9 +10,10 @@ import { pollsRouter } from "./src/routes/polls.routes.ts";
 import { errorHandler } from "./src/middlewares/errorHandler.ts";
 import { authMiddleware } from "./src/middlewares/auth.middleware.ts";
 import { optionsRouter } from "./src/routes/options.routes.ts";
+import healthRouter from "./src/routes/health.routes.ts";
 
 // 3. Import your new socket setup function
-import { setupSocket } from "./src/socket/socket.ts"; 
+import { setupSocket } from "./src/socket/socket.ts";
 
 dotenv.config();
 
@@ -33,18 +34,22 @@ app.set("io", io);
 app.use(cors());
 // app.use(helmet());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // Added urlencoded middleware
+
+// Setup your socket connections
+setupSocket(io); // Moved setupSocket before routes
 
 app.use(authMiddleware);
 
 app.use("/users", userRouter);
 app.use("/polls", pollsRouter);
 app.use("/options", optionsRouter);
+app.use("/health", healthRouter); // Mount the new health router
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
-// Setup your socket connections
 setupSocket(io);
 
 // Error handler MUST be the last middleware!

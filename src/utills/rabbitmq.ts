@@ -13,6 +13,11 @@ export const connectRabbitMQ = async () => {
       durable: true,
     });
     
+    // Assert DLQ
+    await channel.assertQueue("votes.failed", {
+      durable: true,
+    });
+
     console.log("🐰 Connected to RabbitMQ");
   } catch (error) {
     console.error("Failed to connect to RabbitMQ", error);

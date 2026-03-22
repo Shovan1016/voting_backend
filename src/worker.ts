@@ -78,6 +78,7 @@ const START_WORKER = async () => {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
+              "x-internal-secret": process.env.INTERNAL_SECRET || "supersecret"
             },
             body: JSON.stringify({ pollId, options, total }),
           });
@@ -86,11 +87,26 @@ const START_WORKER = async () => {
 
           // e. Acknowledge message
           channel.ack(msg);
-        } catch (error) {
+        } catch (error: any) {
           console.error("Worker Error processing message:", error);
-          // Only reject if it's NOT a duplicate vote error (maybe check Postgres error code 23505)
-          // If it's a structural error, you might want to reject and DLQ it, but we ack for simplicity now to avoid blocking
-          channel.nack(msg, false, false);
+          if (error.code === '23505') {
+            console.log("Duplicate vote detected. Dropping message.");
+            channel.ack(msg);
+          } else {
+            const retryCount = msg.properties.headers?.['x-retry-count'] || 0;
+            if (retryCount < 3) {
+              console.log(`Transient error. Retry ${retryCount + 1}/3 scheduled.`);
+              channel.sendToQueue(queue, msg.content, {
+                persistent: true,
+                headers: { 'x-retry-count': retryCount + 1 }
+              });
+              channel.ack(msg);
+            } else {
+              console.log(`Message failed 3 times. Routing to votes.failed DLQ.`);
+              channel.sendToQueue("votes.failed", msg.content, { persistent: true });
+              channel.ack(msg);
+            }
+          }
         }
       }
     });

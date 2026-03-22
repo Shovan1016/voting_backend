@@ -13,11 +13,24 @@ import {
   updatePool,
 } from "../services/poll.service.ts";
 import { redisClient } from "../utills/redis.ts";
+import { z } from "zod";
+import rateLimit from "express-rate-limit";
 
 const pollsRouter = express.Router();
 
+const voteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { error: "Too many requests from this IP, please try again after a minute" },
+});
+
 pollsRouter.post("/internal/broadcast", async (req, res, next) => {
   try {
+    const internalSecret = req.headers["x-internal-secret"];
+    if (internalSecret !== (process.env.INTERNAL_SECRET || "supersecret")) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
     const { pollId, options, total } = req.body;
     const io = req.app.get("io");
     if (io) {
@@ -181,13 +194,24 @@ pollsRouter.get("/getPoll/:id", authIsNeeded, async (req, res, next) => {
     }
 
     const hashKey = `poll:${pollId}`;
-    const exists = await redisClient.exists(hashKey);
+    let exists = false;
+    let rawTotals: Record<string, string> = {};
+
+    try {
+      // Use truthy check since exists returns a number (1 or 0)
+      if (await redisClient.exists(hashKey)) {
+        exists = true;
+        rawTotals = await redisClient.hGetAll(hashKey);
+        console.log(`Cache HIT for poll ${pollId}`);
+      }
+    } catch (redisErr) {
+      console.warn(`Redis GET failed for poll ${pollId}, falling back to PostgreSQL:`, redisErr);
+      exists = false;
+    }
 
     let totals: Record<string, number> = {};
 
     if (exists) {
-      console.log(`Cache HIT for poll ${pollId}`);
-      const rawTotals = await redisClient.hGetAll(hashKey);
       totals = Object.fromEntries(
         Object.entries(rawTotals).map(([k, v]) => [k, parseInt(v, 10)])
       );
@@ -224,7 +248,11 @@ pollsRouter.get("/getPoll/:id", authIsNeeded, async (req, res, next) => {
       });
 
       if (hsetArgs.length > 0) {
-        await redisClient.hSet(hashKey, hsetArgs);
+        try {
+          await redisClient.hSet(hashKey, hsetArgs);
+        } catch (redisErr) {
+          console.warn(`Redis HSET failed for poll ${pollId}:`, redisErr);
+        }
       }
     }
 
@@ -235,15 +263,18 @@ pollsRouter.get("/getPoll/:id", authIsNeeded, async (req, res, next) => {
   }
 });
 
-pollsRouter.post("/:id/vote", authIsNeeded, async (req, res, next) => {
+pollsRouter.post("/:id/vote", authIsNeeded, voteLimiter, async (req, res, next) => {
   try {
     const pollId = Number(req.params.id);
-    const { optionId } = req.body;
-    const userId = req.user!.id;
-
-    if (!optionId) {
-      return next(new AppError("optionId is required", 400));
+    
+    // Validate optionId is a number
+    const voteSchema = z.object({ optionId: z.number() });
+    const validationResult = voteSchema.safeParse(req.body);
+    if (!validationResult.success) {
+      return next(new AppError(validationResult.error.issues[0].message, 400));
     }
+    const { optionId } = validationResult.data;
+    const userId = req.user!.id;
 
     // 1. Check if poll exists and is open, and option belongs to poll
     const existingPool = await getPollById(pollId);
@@ -296,4 +327,35 @@ pollsRouter.post("/:id/vote", authIsNeeded, async (req, res, next) => {
   }
 });
 
+pollsRouter.get("/:id/myVote", authIsNeeded, async (req, res, next) => {
+  try {
+    const pollId = Number(req.params.id);
+    const userId = req.user!.id;
+
+    const { eq, and } = await import("drizzle-orm");
+    const db = (await import("../index.ts")).default;
+    const { votesTable } = await import("../db/schemas/votes.schema.ts");
+
+    const existingVote = await db.query.votesTable.findFirst({
+      where: and(eq(votesTable.pollId, pollId), eq(votesTable.userId, userId)),
+    });
+
+    if (!existingVote) {
+      return res.status(200).json({
+        voted: false,
+        optionId: null,
+      });
+    }
+
+    return res.status(200).json({
+      voted: true,
+      optionId: existingVote.optionId,
+    });
+  } catch (error) {
+    console.error("myVote error:", error);
+    next(error);
+  }
+});
+
 export { pollsRouter };
+
