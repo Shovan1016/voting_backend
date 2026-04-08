@@ -4,6 +4,8 @@ import {
   pgTable,
   timestamp,
   unique,
+  uuid,
+  // uuid,
 } from "drizzle-orm/pg-core";
 import { pollsTable } from "./polls.schema.ts";
 import { pollOptionsTable } from "./options.schema.ts";
@@ -13,7 +15,7 @@ import { usersTable } from "./user.schema.ts";
 export const votesTable = pgTable(
   "votes",
   {
-    id: integer().primaryKey().generatedByDefaultAsIdentity(),
+    id: uuid("id").primaryKey().defaultRandom(),
     pollId: integer()
       .notNull()
       .references(() => pollsTable.id, { onDelete: "cascade" }),
@@ -32,7 +34,7 @@ export const votesTable = pgTable(
       table.pollId,
       table.userId,
     ),
-    pollIdIndex: index("idx_votes_poll_id").on(table.pollId), 
+    pollIdIndex: index("idx_votes_poll_id").on(table.pollId),
     optionIdIndex: index("idx_votes_option_id").on(table.optionId),
   }),
 );

@@ -8,7 +8,7 @@ export interface AuthenticatedSocket extends Socket {
   user?: any; // Tip: Replace 'any' with your actual User database type/interface
 }
 
-export const setupSocket = (io: Server) => {
+export const setupSocket = async (io: Server) => {
   // 2. Add the async authentication middleware
   io.use(async (socket: AuthenticatedSocket, next) => {
     try {
@@ -28,7 +28,7 @@ export const setupSocket = (io: Server) => {
       }
 
       // Re-use your existing database service
-      const user = await userFindById(result.id);
+      const user = await userFindById(Number(result.id));
 
       if (!user) {
         return next(new Error("Unauthorized: User not found"));
@@ -47,14 +47,11 @@ export const setupSocket = (io: Server) => {
 
   // 3. Handle the actual connection (this only runs if next() was called above)
   io.on("connection", (socket: AuthenticatedSocket) => {
-
-    socket.on("join_poll_room", (pollId: string) => {
-      socket.join(pollId);
-      console.log(`User ${socket.user.id} joined poll room: ${pollId}`);
+    // Exact room pattern as requested
+    socket.on("join-poll", (pollId: string) => {
+      socket.join(`poll:${pollId}`);
+      console.log(`User ${socket.user.id} joined poll room: poll:${pollId}`);
     });
-
-    // socket.on("join_poll_room", (pollId) => socket.join(pollId));
-    socket.on("leave_poll_room", (pollId) => socket.leave(pollId));
 
     socket.on("disconnect", () => {
       console.log(`❌ User ${socket.user.id} disconnected`);
