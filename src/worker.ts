@@ -5,25 +5,36 @@ import db from "./index.ts";
 import { votesTable } from "./db/schemas/votes.schema.ts";
 
 const START_WORKER = async () => {
+  let redisClient: any;
+  let channel: amqp.Channel;
+  const queue = "votes.incoming";
+
+  while (true) {
+    try {
+      // 1. Connect to Redis
+      const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
+      redisClient = createClient({ url: redisUrl });
+      redisClient.on("error", (err) => console.log("Worker Redis Error", err));
+      await redisClient.connect();
+      console.log("🔴 Worker connected to Redis");
+
+      // 2. Connect to RabbitMQ
+      const rmqUrl = process.env.RABBITMQ_URL || "amqp://localhost";
+      const connection = await amqp.connect(rmqUrl);
+      channel = await connection.createChannel();
+      
+      await channel.assertQueue(queue, { durable: true });
+      // channel.prefetch(1); // Optional: Process 1 message at a time
+
+      console.log("🐰 Worker connected to RabbitMQ. Waiting for messages...");
+      break; // Successfully connected to both, exit the loop
+    } catch (error: any) {
+      console.error("Worker failed to connect to services. Retrying in 5 seconds...", error.message);
+      await new Promise((res) => setTimeout(res, 5000));
+    }
+  }
+
   try {
-    // 1. Connect to Redis
-    const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
-    const redisClient = createClient({ url: redisUrl });
-    redisClient.on("error", (err) => console.log("Worker Redis Error", err));
-    await redisClient.connect();
-    console.log("🔴 Worker connected to Redis");
-
-    // 2. Connect to RabbitMQ
-    const rmqUrl = process.env.RABBITMQ_URL || "amqp://localhost";
-    const connection = await amqp.connect(rmqUrl);
-    const channel = await connection.createChannel();
-    
-    const queue = "votes.incoming";
-    await channel.assertQueue(queue, { durable: true });
-    // channel.prefetch(1); // Optional: Process 1 message at a time
-
-    console.log("🐰 Worker connected to RabbitMQ. Waiting for messages...");
-
     // 3. Consume messages
     channel.consume(queue, async (msg) => {
       if (msg) {
